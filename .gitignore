@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# 转写产物与凭据：绝不入库
+transcript*.txt
+transcript*.json
+*.vtt
+*.srt
+refresh_token
+access_token*
