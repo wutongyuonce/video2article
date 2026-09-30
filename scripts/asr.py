@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""本地转写音频/视频：静音优先分片 + 超限重试。
+"""本地音频/视频转写，中文和中英混说优先使用 Qwen3-ASR-1.7B。
 
 用法:
     uv run --with transcribe-cpp python asr.py <audio|video> <model.gguf>
@@ -10,14 +10,8 @@
 
 依赖: Python 3.9+、ffmpeg / ffprobe 在 PATH 上、transcribe-cpp。
 
-为什么分片: LLM 式 ASR（qwen3 / voxtral / canary / cohere / moss）整段音频是一次
-连续生成，有生成 token 上限——Qwen3-ASR 实测约 474 字就 OutputTruncated，且与音频
-长度和 n_ctx 都无关。窗口式模型（whisper / sensevoice / parakeet）没有这个上限，
-但分片对它们无害（只是多几次调用）。
-
-为什么按静音切而不是固定时长: 固定时长会在句子中间斩断，而静音点落在停顿处。
-静音检测整片扫一遍只要约 0.6 秒（21 分钟音频），相对转写耗时（约 80 秒）可忽略。
-找不到静音时自动退回固定切点，所以永不退化。
+脚本按短片段处理长录音，优先把切点放在静音处；模型明确报告输出截断时，
+自动对半切片重试。找不到静音时退回固定切点。
 """
 
 from __future__ import annotations
@@ -29,14 +23,13 @@ import sys
 
 TARGET_SECONDS = 60.0
 WINDOW_SECONDS = 12.0
-# 片长硬上限：Qwen3-ASR 实测 75s → 427 字（安全），90s 就截断。
-# 切点吸附最远漂移到 target+window，所以必须保证它仍在上限内。
+# 静音吸附最多延长到 target+window；限制片长以便输出截断时可快速恢复。
 MAX_SAFE_SECONDS = 75.0
 SILENCE_DB = -30
 SILENCE_MIN_SECONDS = 0.3
 SAMPLE_RATE = 16000
-# 中文口播约 5.5–6 字/秒；低于这个值基本就是漏片或被截断，而不是语速慢
-MIN_SANE_DENSITY = 5.0
+# 常见中文口播约 5–6 字/秒；慢速或停顿较多时会更低，密度只作核验提示。
+DENSITY_WARNING_THRESHOLD = 5.0
 
 
 def _run(cmd: list[str]) -> bytes:
@@ -163,11 +156,14 @@ def transcribe_file(
         model.close()
 
     text = "\n".join(p for p in parts if p.strip())
-    # 自查：中文口播约 5.5–6 字/秒，明显偏低说明漏片或被截断（见 SKILL.md 的完整性校验）
+    # 密度只提示复核：语速慢、停顿多的音频也可能低于阈值。
     chars = len(re.sub(r"\s", "", text))
     if total > 0 and chars:
         density = chars / total
-        warn = "   ⚠ 偏低，检查是否漏片" if density < MIN_SANE_DENSITY else ""
+        warn = (
+            "   ⚠ 请核对音频开头和结尾"
+            if density < DENSITY_WARNING_THRESHOLD else ""
+        )
         print(f"  转写 {chars} 字 · 密度 {density:.2f} 字/秒{warn}", file=sys.stderr)
     return text
 

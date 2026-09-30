@@ -32,7 +32,7 @@
 |---|---|---|
 | YouTube | yt-dlp 拉字幕 | 优先人工轨，与视频时长无关 |
 | 小宇宙 | 官方逐字稿 API | 默认路径；需 BYO-token，无上限且自带时间戳 |
-| B 站 / 其他无字幕来源 | 本地 ASR | pi 下用 `@earendil-works/pi-voice`，否则用自带 `asr.py` |
+| B 站 / 其他无字幕来源 | 本地 ASR | 中文优先 Qwen3-ASR；Pi 可用 `@earendil-works/pi-voice`，长音频或非 Pi 环境用 `asr.py`；macOS 可用 Whisper.cpp 备用 |
 
 ## 安装
 
@@ -47,8 +47,9 @@ git clone https://github.com/wutongyuonce/video2article .claude/skills/video2art
 依赖：
 
 - Python 3.9+、`ffmpeg`（`brew install ffmpeg`）
-- `uv` / `uvx`（跑 `yt-dlp`、`transcribe-cpp`、`huggingface_hub`，无需预先 pip install）
-- 可选：`@earendil-works/pi-voice`（pi 环境下的本地转写工具）
+- `uv` / `uvx`（运行 `yt-dlp`、`transcribe-cpp`、`huggingface_hub`，无需预先 pip install）
+- 本地 ASR 需要 `ffmpeg` / `ffprobe`；macOS 备用 Whisper CLI：`brew install whisper.cpp ffmpeg`
+- 可选：`@earendil-works/pi-voice`（Pi 环境下的本地转写工具）
 
 ## 用法
 
@@ -59,16 +60,34 @@ git clone https://github.com/wutongyuonce/video2article .claude/skills/video2art
 python3 scripts/xyz.py "<单集URL|eid>" -o transcript.txt --json transcript.json
 python3 scripts/xyz.py --whoami              # 只验凭据
 
-# 本地 ASR（静音优先分片 + 超限对半切重试，全自动）
+# 本地 ASR：中文优先 Qwen3-ASR；长音频自动静音优先分片，截断片段会重试
+AUDIO="audio.mp3" # 按实际下载的文件名填写
 MODEL=$(uvx --from huggingface_hub hf download -q \
   handy-computer/Qwen3-ASR-1.7B-gguf Qwen3-ASR-1.7B-Q8_0.gguf)
-uv run --with transcribe-cpp python scripts/asr.py <音频> "$MODEL" > transcript.txt
+uv run --with transcribe-cpp python scripts/asr.py "$AUDIO" "$MODEL" > transcript.txt
+
+# macOS 备用：Whisper.cpp CLI（先 brew install whisper.cpp ffmpeg，模型需另行下载）
+mkdir -p "$HOME/.cache/whisper.cpp"
+MODEL="$HOME/.cache/whisper.cpp/ggml-large-v3.bin"
+curl -L --fail -o "$MODEL" \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+ffmpeg -i "$AUDIO" -ar 16000 -ac 1 -c:a pcm_s16le audio.wav
+whisper-cli -m "$MODEL" -f audio.wav --language zh \
+  --output-txt --output-file transcript
 
 # WebVTT 字幕转纯文本（合并滚动窗口重复行）
 python3 scripts/vtt2txt.py subtitles.en.vtt > transcript.txt
 ```
 
-三个脚本都带离线自检：`python3 scripts/xyz.py --selftest`。
+三个脚本都带离线自检：
+
+```bash
+python3 scripts/xyz.py --selftest
+python3 scripts/asr.py --selftest
+python3 scripts/vtt2txt.py --selftest
+```
+
+`asr.py` 的低于 5 字/秒提示只用于触发复核，不单独证明漏转；开始写作前仍须核对音频首尾和专有名词。
 
 ## 小宇宙凭据
 
@@ -84,14 +103,14 @@ python3 scripts/vtt2txt.py subtitles.en.vtt > transcript.txt
 
 | 结论 | 依据 |
 |---|---|
-| Qwen3-ASR 必须分片 | 输出上限约 **474 字**，与音频长度、与 `n_ctx` 都无关（8192→262144 输出全是 474 字）。75s 片段正常，**90s 报 `run output truncated`** |
+| Qwen3-ASR 必须分片 | 实测输出上限约 **474 字**，与音频长度、与 `n_ctx` 都无关（8192→262144 输出全是 474 字）；75s 片段正常，**90s 报 `run output truncated`**。当前 `asr.py` 默认约 60s 一片，优先吸附静音，截断时再递归二分重试 |
 | 分片要吸附静音 | 固定时长硬切会斩断句子，模型在切口补一个句号，**造出原话不存在的假句界** |
 | 小宇宙官方稿无需分片 | 4 小时单集，**一次请求 71792 字、覆盖 100%** |
 | 逐字稿 CDN 只认 App UA | 浏览器 UA 直接 **403 Forbidden** |
 | `{"data": null}` 不是「这期没稿」 | 一轮 30 期里 3 期返回 null，同一期连打 15 次全过，复测 30 期首次即成功——**必须重试** |
 | 官方逐字稿也是机器稿 | 接口标注 `vendorDeclaration: "*文稿由小宇宙自动生成"` |
 | 两条路径互相印证 | 同一期 719.8s 播客：官方稿去标记后 **4174 字**（5.81 字/秒），本地 ASR **4189 字**（5.82 字/秒），**差 0.4%** |
-| 完整性判据要分开 | 播客实测密度 **5.08–9.57 字/秒**，比视频口播宽得多，不能用一个阈值判断所有来源 |
+| 完整性判据要分开 | 播客实测密度 **5.08–9.57 字/秒**，比视频口播宽得多，不能用一个阈值判断所有来源；脚本低于 5 字/秒只提示人工复核，完整性仍靠首尾和片段核对 |
 
 还有一条来自踩坑：小宇宙官方 shownotes 里时间戳和标题隔着内联标签（`<a class="timestamp">00:02:35</a> 标题`），**把所有 HTML 标签都换成换行会把两者拆开**，把 `00:02:35 英伟达的赌注与边界` 错切成 `ts=00:02 / title=35`。只有块级标签该换行。
 
@@ -104,7 +123,7 @@ video2article/
 ├── LICENSE
 └── scripts/
     ├── xyz.py            # 小宇宙官方逐字稿：续期 / 重试 / CDN / 元信息 / 官方章节
-    ├── asr.py            # 本地 ASR：静音优先分片 + 超限对半切 + 密度自查
+    ├── asr.py            # Qwen 本地 ASR：静音优先分片 + 截断重试 + 密度复核提示
     └── vtt2txt.py        # WebVTT -> 纯文本
 ```
 

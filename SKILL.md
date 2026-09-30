@@ -5,8 +5,7 @@ description: |
   让读者不打开视频、只看文字就能完整理解内容，读起来像一篇 Blog。
   Reactive: 用户给出链接或视频/单集 ID，并说「重写成文章 / 阅读版 / 视频转文章 / 整理成文字 /
   帮我读一下这个视频 / 这个视频讲了什么(要详细)」。
-  转写来源：YouTube 拉字幕；小宇宙取官方逐字稿（scripts/xyz.py，需自带 token）；
-  B 站等无字幕来源做音频转写（pi 下用 pi-voice，否则 scripts/asr.py）。
+  转写来源：YouTube 拉字幕；小宇宙取官方逐字稿（scripts/xyz.py）；无字幕来源优先用 Qwen3-ASR 本地转写，也可在 macOS 用 Whisper.cpp CLI。
   不适合：只要一句话摘要或要点列表；只要逐字稿原文（跑 yt-dlp 即可，不必重写）。
 ---
 
@@ -43,8 +42,7 @@ description: |
 |---|---|---|
 | YouTube | 任意 | **A. 拉字幕**（首选，与视频时长无关） |
 | 小宇宙 | 任意 | **B. 官方逐字稿**（默认；没凭据先取凭据） |
-| B 站或其他无字幕来源 | pi + `@earendil-works/pi-voice` | **C1. 本地转写** |
-| B 站或其他无字幕来源 | 非 pi（Codex / Claude Code / Cursor / shell） | **C2. 自建转写** |
+| B 站或其他无字幕来源 | 任意 | **C. Qwen3-ASR 本地转写**（首选；macOS 可用 Whisper.cpp CLI） |
 
 **小宇宙永远先试 B**，只有 B 走不通（用户不愿登录，或重试后仍拿不到稿）才退到 C。
 
@@ -78,137 +76,81 @@ yt-dlp 会警告「No supported JavaScript runtime」——拿字幕不受影响
 
 ### B. 小宇宙：官方逐字稿（默认路径）
 
-小宇宙自带逐字稿，不用做本地转写。但它同样是机器稿（接口里写着 `vendorDeclaration: "*文稿由小宇宙自动生成"`），专名照样会错。
-
-优势是决定性的：**无输出上限、自带 `startMs` 时间戳、一次 HTTP 拿全**（实测 4 小时那期单请求 71792 字、覆盖 100%）。所以走这条时，C 里那套分片 / 静音吸附 / 超限对半切全都不需要。
+先取平台官方逐字稿，再考虑本地 ASR。它包含时间戳、节目元信息和官方章节，可用章节作为文章大纲；但仍是机器稿，专有名词需要核对。
 
 ```bash
 python3 "<本 skill 目录>/scripts/xyz.py" "<单集URL|eid>" -o transcript.txt --json transcript.json
-python3 "<本 skill 目录>/scripts/xyz.py" --whoami      # 只验凭据
+python3 "<本 skill 目录>/scripts/xyz.py" --whoami # 检查凭据
 ```
 
-脚本自处理：凭据续期与回写、`data:null` 重试、CDN 的 App UA、元信息与官方章节、覆盖率统计。stdout 是逐字稿（每约 120s 插 `[HH:MM:SS]` 锚点），stderr 是元信息 / 章节 / 统计。
+正文需要本人小宇宙登录态。脚本优先读 `$XYZ_REFRESH_TOKEN`，其次读 `~/.config/xiaoyuzhou/refresh_token`；凭据缺失时先让用户登录并提供 `x-jike-refresh-token` cookie。凭据只保存在本地，不能写入产出文件或提交仓库。
 
-#### 凭据是这条路的前提
-
-逐字稿正文在小宇宙私有接口后面，**网页和公开 API 只给音频**。凭据没有申请渠道，只能是你自己账号的登录态。查找顺序 `$XYZ_REFRESH_TOKEN` → `~/.config/xiaoyuzhou/refresh_token`；两个都没有就先取：
-
-**首选：用任意浏览器自动化工具自动取**（ego-browser / Playwright / Chrome DevTools MCP 之类都行）
-
-```
-1. 打开登录页 https://accounts.xiaoyuzhoufm.com/login —— 登录站在 accounts，不是 www
-   （www 根路径是营销落地页，没有登录入口）
-2. 切「扫码登录」，把控制权交给用户，让他用手机小宇宙 App 扫码
-3. 用户确认后，从浏览器读名为 x-jike-refresh-token 的 cookie
-   （CDP Network.getCookies，或工具自己的 cookie / 存储接口）
-4. 写 ~/.config/xiaoyuzhou/refresh_token（目录 700、文件 600）
-```
-
-用 CDP 或工具的存储接口而不是 `document.cookie`，是因为 cookie 可能是 httpOnly。
-
-**兜底：让用户手动取**（没有浏览器自动化工具时）——F12 → Application / 存储 → Cookies → `x-jike-refresh-token` 复制值（或 Network 里看任意请求的 `Cookie:` 那一行），存到上面那个路径。
-
-**凭据纪律**：只存本地，**绝不写进产出文件或提交仓库**。
-
-别去猜 token 什么时候过期：解出来 payload 只有 `data` / `v` / `iv` / `iat`，**没有 `exp`**，时效由服务端定。`xyz.py` 的做法是每次运行都先刷一次、拿到就用，所以 TTL 不相关。refresh 每次都会换发新的（`iat` 随之更新），回写是为了跟上轮换而不是续命；回写失败只警告不中断（refresh 已成功，逐字稿照取）。用 `$XYZ_REFRESH_TOKEN` 时脚本不落盘。
-
-#### 拿到稿之后
-
-`xyz.py` 会一并给出元信息（标题 / 播客 / 作者 / 时长，Metadata 小节要用）和**官方章节（带时间戳）**——章节不需要凭据就能拿，直接当文章小节的骨架，比从零按主题重组省事。单集页公开的 `.shownotes` 里作者也常放大纲，值得读一遍再动笔。
-
-#### 失败处理
-
-- **`{"data": null}` 是偶发瞬时抖动，不是「这期没稿」**，必须重试（`xyz.py` 内置 3 次退避）。见到 null 就退回 ASR 是错的。
-- 重试仍为 null 才当这期不可用，退到 C 做本地转写，并告诉用户走了退路。
-- CDN 只认 App UA，浏览器 UA 直接 403。别改 `xyz.py` 里的 `UA_APP`。
-- 私有接口是逆向所得，平台改版会失效；个人存档用途，产出别公开转载。
+脚本会刷新凭据并重试瞬时的空结果；成功时输出带时间锚点的逐字稿、元信息、章节和覆盖率。重试后仍拿不到稿，再切换到 C 的 Qwen 本地转写，并说明使用了退路。
 
 ### C. 音频转写（B 站 / 其他无字幕来源）
 
-#### 第 0 步：下音频
+先下载音频（B 站优先取音频轨；其他站点按默认格式下载）：
 
 ```bash
-# B 站：字幕基本不能用（没人工轨，自动轨也很烂），走音频；未登录即可下载
-uvx yt-dlp -f 30232 -o "bili.%(ext)s" "<URL>"
-
-# 小宇宙（只在 B 走不通时才用）：没有字幕轨，同样下音频
-uvx yt-dlp -o "xyz.%(ext)s" "<URL>"
+# B 站
+uvx yt-dlp -f 30232 -o "audio.%(ext)s" "<URL>"
+# 其他站点
+uvx yt-dlp -o "audio.%(ext)s" "<URL>"
+AUDIO="audio.mp3" # 按实际下载的扩展名填写
 ```
 
-小宇宙音频免登录。yt-dlp 没有专用 extractor、走 generic，`--list-subs` 明确回 `has no subtitles`。不想用 yt-dlp 时等价方案：
+#### 首选：Qwen3-ASR
+
+中文或中英混说优先 **Qwen3-ASR-1.7B**。
+
+**Pi 中使用 pi-voice：**安装插件和 FFmpeg，在 `/voice-settings` 里选择 Qwen3-ASR；然后让 Pi 调用 `transcribe_file` 工具（它不是 shell 命令）。
 
 ```bash
-curl -s "https://www.xiaoyuzhoufm.com/api/episodes/<eid>" | python3 -c \
-  'import json,sys; print(json.load(sys.stdin)["enclosure"]["url"])'
+pi install npm:@earendil-works/pi-voice
+brew install ffmpeg
 ```
 
-**yt-dlp 对小宇宙的元数据很烂**：只有 `title` 准，`uploader` 是 `www.xiaoyuzhoufm.com`、`duration` 是 `NA`。Metadata 小节的作者和时长走上面那个 API。
-
-#### C1. pi + pi-voice
-
-**前提：装了 `@earendil-works/pi-voice`，且 ffmpeg 在 PATH 上**（`brew install ffmpeg`）。`transcribe_file` 是该插件注册的工具，**不是系统命令**——上游 `transcribe.cpp` 只发布库文件，不提供 CLI。缺 ffmpeg 会报 `File transcription requires FFmpeg`。
-
-**Qwen 必须分片**：有没有输出上限取决于架构族，不取决于具体模型。窗口式（whisper / sensevoice / parakeet）逐窗独立解码 → 无上限，整个文件直接喂；LLM 式（qwen3 / voxtral / canary / cohere / moss）整段一次连续生成 → 有上限。Qwen3-ASR 实测上限约 **474 字**，与音频长度、与 `n_ctx` 都无关（`n_ctx` 从 8192 调到 262144，输出全是 474 字）。
-
-所以按 **60s 为目标**分片，切点吸附到静音中点：
+`transcribe_file` 适合 35 分钟以内的音频；更长音频或非 Pi 环境，使用仓库中的 `scripts/asr.py`。需要 `uv` 和 FFmpeg（macOS 可用 `brew install uv ffmpeg`）：
 
 ```bash
-# 找可切的静音点。不要加 -v error，会吞掉 silencedetect 的 INFO 输出，误判成「没有静音」
-ffmpeg -i <音频> -af silencedetect=noise=-30dB:d=0.3 -f null - 2>&1 | grep silence_
-
-# 按吸附后的切点切段（示例切点 58.6 / 119.1）。不用重采样，transcribe_file 自己处理
-ffmpeg -v error -ss 0    -t 58.6 -i <音频> part00.mp3
-ffmpeg -v error -ss 58.6 -t 60.5 -i <音频> part01.mp3
-```
-
-每段依次喂 `transcribe_file`，把结果拼接。**为什么要吸附**：固定时长硬切会斩断句子，Qwen 会在切口补一个句号，造出原话不存在的假句界（实测硬切「…所以暂时。| 测试不了啊。」vs 静音切「…所以暂时测试不了啊。|」）。找不到静音就退回固定切点，不退化。片长硬上限 75s（75s → 427 字仍安全，90s 就截断——90s 片段实测报 `run output truncated`）。
-
-超限会抛错、不会静默返回半截——某片报错就对半切重试。窗口式模型不用分片。
-
-> 嫌麻烦就直接用 C2 的 `scripts/asr.py`：它把静音优先分片 + 超限对半切全自动了，模型反正已经在 HF 缓存里（pi-voice 下过），pi 环境下跑它也完全可以。
-
-#### C2. 非 pi：自建转写
-
-只需三样公开依赖：Python 3.9+、ffmpeg、`transcribe-cpp`。模型与库和 pi-voice 同一套，可复用其 HuggingFace 缓存。
-
-```bash
-# 不加 --local-dir：那会绕开 HF 缓存、在当前目录再落一份 2GB 且路径随 cwd 漂移。
-# 默认落 ~/.cache/huggingface/hub（与 pi-voice 同目录，blob 内容寻址，已下过就是 no-op）。
-# -q 只输出解析后的绝对路径。
+# 模型下载到 Hugging Face 默认缓存，可供 Pi Voice 和脚本共用
 MODEL=$(uvx --from huggingface_hub hf download -q \
   handy-computer/Qwen3-ASR-1.7B-gguf Qwen3-ASR-1.7B-Q8_0.gguf)
-# 中文替代：SenseVoiceSmall-gguf（241 MB，无输出上限，但专名明显较差）
 
-# 下音频见「第 0 步」。
-
-# 脚本内建静音优先分片 + 超限对半切重试；可调 --chunk 60 --window 12，--fixed 退回固定切分
 uv run --with transcribe-cpp python \
-  "<本 skill 目录>/scripts/asr.py" <音频> "$MODEL" > transcript.txt
+  "<本 skill 目录>/scripts/asr.py" "$AUDIO" "$MODEL" > transcript.txt
 ```
 
-要自己写 Node 的话：`TranscribeModel.load(path)` → `model.transcribe(pcm)`，输入 16 kHz 单声道 float32 PCM。**pi-voice 不检查 `result.truncated` 标志，自己写必须捕 `OutputTruncated` 或查该标志。**
+脚本会静音优先分片、自动重试被截断片段，并输出转写字数密度。密度低于 5 字/秒只作复核提示：检查音频开头、结尾和片段，不要单凭密度判定漏转。长音频优先用此脚本，不要手工拼切片。
 
-### 完整性校验（两条路都要做）
+#### 备用：macOS Whisper.cpp CLI
 
-- **B 路径**看时间戳覆盖率：`xyz.py` 会打印 `覆盖 X%`，低于 90% 自己告警。实测 30 期在 98%–100%（偶尔 >100% 是末尾 `[Silence]` 时间戳超过 duration 字段，不是问题）。
-- **C 路径**算字数密度 `转写字数 ÷ 音频秒数`（只数非空白字符）。`asr.py` 跑完会直接把这行打到 stderr，低于 5 字/秒 自己加 ⚠。偏低说明漏片或被截断——停下来重做，**不要拿半截转写去写文章**。
+Qwen 不可用时，可用 Whisper 自带 CLI。Homebrew 安装的是运行工具，模型文件需另行下载：
 
-别把两条判据混用：播客实测密度 5.08–9.57 字/秒，比视频口播宽得多，所以密度只适合判断 ASR 是否漏片。
+```bash
+brew install whisper.cpp ffmpeg
+mkdir -p "$HOME/.cache/whisper.cpp"
+MODEL="$HOME/.cache/whisper.cpp/ggml-large-v3.bin"
+curl -L --fail -o "$MODEL" \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
 
-一个交叉验证的例子（同一期 719.8s 播客）：官方逐字稿去标记后 4174 字（5.81 字/秒），本地 ASR 4189 字（5.82 字/秒），**差 0.4%**。两条独立路径互相印证，说明这套判据是可靠的。
+ffmpeg -i "$AUDIO" -ar 16000 -ac 1 -c:a pcm_s16le audio.wav
+whisper-cli -m "$MODEL" -f audio.wav --language zh \
+  --prompt "节目主题、主持人姓名和本期专有名词" \
+  --output-txt --output-file transcript
+```
 
-### 专有名词必须交叉核对（两条路都要做）
+`--output-file transcript` 会生成 `transcript.txt`。提示词只放简短的背景和专名。
 
-**官方逐字稿也是机器稿**，所以这不是「本地转写的补救措施」，而是两条路一视同仁。错误集中在人名、队名、术语、数字，且多是**同音替换、读起来完全通顺**，不能靠「读得顺」判断对错。实测：
+### 转写校验
 
-- 本地 ASR 把 UP 主本人的 `泽元` 转成 `泽淵`（出现 4 次）、`GEN.G` → `GENGIE`、`老生常谈` → `老生长长`、`狗熊有话说` → `狗熊软话说`
-- 官方逐字稿把 `狗熊有话说` 转成 `狗讯话说`
+- **YouTube 字幕**：优先人工字幕；自动字幕中的 `[Music]`、`[Applause]` 等非语音标记不写进正文。
+- **小宇宙逐字稿**：检查 `xyz.py` 输出的时间戳覆盖率，低于 90% 时停止并重试或切换 ASR。
+- **本地 ASR**：核对音频开头和结尾，确认全文没有提前结束。`asr.py` 的低密度提示只用于触发复核；未确认完整前不要开始写作。
 
-同一个节目名，两条路各错成一个不同的错法——所以不能因为「官方出的」就免检。同一份转写内部还会自相矛盾（`BO5` 与 `比欧武` 并存）——**发现不一致就是错误的明确信号**。
+### 专有名词核对
 
-用标题、简介、评论区、官方章节或搜索核对。核实不了的保留原转写音并标注「不确定」，不要写成一个看着像真的名字。
-
-**官方逐字稿还带 `[Music]` `[Silence]` 这类标记**，和 YouTube 自动字幕同款：不是人说的，除非本身构成内容，否则不写进文章。
+ASR 和平台逐字稿都可能把人名、公司名、术语和数字识别错。用节目标题、简介、章节或可靠来源核对；无法确认的内容保留不确定性，不要猜写。
 
 ## 第二步：写作
 
@@ -216,10 +158,10 @@ uv run --with transcribe-cpp python \
 
 ## 第三步：交付前自检
 
-- [ ] 转写完整性已验证（B 看覆盖率，C 看密度）
+- [ ] 转写完整性已验证（B 看覆盖率；C 核对音频开头、结尾，脚本低密度提示仅供复核）
 - [ ] 每个小节、每个 framework / mindset 的正文达到 500 字下限（数一下，不要目测）
 - [ ] 没有出现转写里找不到的数字、人名、结论
-- [ ] 专有名词已交叉核对（两条路都要）；核实不了的标了「不确定」
+- [ ] 人名、公司名和术语已核对；无法确认的标了「不确定」
 - [ ] `[Music]` / `[Silence]` 之类的非语音标记没被写进正文
 - [ ] 含混处已标注，而不是被我补成了确定说法
 - [ ] 正文里没有自指的要求类句子（「> 500 字」等）
