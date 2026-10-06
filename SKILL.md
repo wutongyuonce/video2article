@@ -48,21 +48,31 @@ description: |
 
 ### A. YouTube：拉字幕
 
+优先使用 PATH 中已安装的 `yt-dlp`（例如通过 Homebrew 安装的版本）；只有找不到本机命令时，才通过 `uvx` 临时运行。下面的 shell 函数会按此顺序选择：
+
 ```bash
 ID=<video_id>; mkdir -p /tmp/v2a-$ID && cd /tmp/v2a-$ID
 
+yt_dl() {
+  if command -v yt-dlp >/dev/null 2>&1; then
+    command yt-dlp "$@"
+  else
+    uvx yt-dlp "$@"
+  fi
+}
+
 # 必须看这一步：人工轨和自动轨分列在两个小节（"Available subtitles" / "Available automatic captions"）
-uvx yt-dlp --list-subs --skip-download "<URL>"
+yt_dl --list-subs --skip-download "<URL>"
 
 # 一次只指定一种语言。多语言写法（"en.*,zh.*"）会连续请求多条轨道并触发 HTTP 429
-uvx yt-dlp --skip-download --write-subs --write-auto-subs \
+yt_dl --skip-download --write-subs --write-auto-subs \
   --sub-langs "en" --sub-format vtt -o "%(id)s.%(ext)s" "<URL>"
 # 中文视频用 zh-Hans / zh-Hant，按上一步列出的轨道名写
 
 python3 "<本 skill 目录>/scripts/vtt2txt.py" $ID.en.vtt > transcript.txt
 
 # 元信息：必须每个字段一次 --print。用 "%(title)s|%(uploader)s|..." 单行分隔在标题含 | 时会错位
-uvx yt-dlp --skip-download --print "%(title)s" --print "%(uploader)s" \
+yt_dl --skip-download --print "%(title)s" --print "%(uploader)s" \
   --print "%(duration)s" --print "%(webpage_url)s" "<URL>"
 ```
 
@@ -92,10 +102,18 @@ python3 "<本 skill 目录>/scripts/xyz.py" --whoami # 检查凭据
 先下载音频（B 站优先取音频轨；其他站点按默认格式下载）：
 
 ```bash
+yt_dl() {
+  if command -v yt-dlp >/dev/null 2>&1; then
+    command yt-dlp "$@"
+  else
+    uvx yt-dlp "$@"
+  fi
+}
+
 # B 站
-uvx yt-dlp -f 30232 -o "audio.%(ext)s" "<URL>"
+yt_dl -f 30232 -o "audio.%(ext)s" "<URL>"
 # 其他站点
-uvx yt-dlp -o "audio.%(ext)s" "<URL>"
+yt_dl -o "audio.%(ext)s" "<URL>"
 AUDIO="audio.mp3" # 按实际下载的扩展名填写
 ```
 
