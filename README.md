@@ -32,7 +32,7 @@
 |---|---|---|
 | YouTube | yt-dlp 拉字幕 | 优先人工轨，与视频时长无关 |
 | 小宇宙 | 官方逐字稿 API | 默认路径；需 BYO-token，无上限且自带时间戳 |
-| B 站 / 其他无字幕来源 | 本地 ASR | 中文优先 Qwen3-ASR；Pi 可用 `@earendil-works/pi-voice`，长音频或非 Pi 环境用 `asr.py`；macOS 可用 Whisper.cpp 备用 |
+| B 站 / 其他无字幕来源 | 本地 ASR | 中文优先 Qwen3-ASR，统一用 `asr.py` 转写；macOS 可用 Whisper.cpp 备用 |
 
 ## 安装
 
@@ -47,9 +47,9 @@ git clone https://github.com/wutongyuonce/video2article .claude/skills/video2art
 依赖：
 
 - Python 3.9+、`ffmpeg`（`brew install ffmpeg`）
-- `uv` / `uvx`（运行 `yt-dlp`、`transcribe-cpp`、`huggingface_hub`，无需预先 pip install）
-- 本地 ASR 需要 `ffmpeg` / `ffprobe`；macOS 备用 Whisper CLI：`brew install whisper.cpp ffmpeg`
-- 可选：`@earendil-works/pi-voice`（Pi 环境下的本地转写工具）
+- `uv` / `uvx`（管理 `yt-dlp`、ASR 后端和 `huggingface_hub` 的运行依赖）
+- 本地 ASR 需要 `ffmpeg` / `ffprobe`；`asr.py` 先找本地 Qwen3-ASR，按 GGUF / MLX 格式选择 `transcribe-cpp` / `mlx-audio`，缺少库时由 uv 在 Python 3.12 环境中安装
+- macOS 备用 Whisper CLI：`brew install whisper.cpp ffmpeg`
 
 ## 用法
 
@@ -60,11 +60,13 @@ git clone https://github.com/wutongyuonce/video2article .claude/skills/video2art
 python3 scripts/xyz.py "<单集URL|eid>" -o transcript.txt --json transcript.json
 python3 scripts/xyz.py --whoami              # 只验凭据
 
-# 本地 ASR：中文优先 Qwen3-ASR；长音频自动静音优先分片，截断片段会重试
+# 本地 ASR：先复用已有 Qwen3-ASR，按格式加载并自动准备缺少的推理库
 AUDIO="audio.mp3" # 按实际下载的文件名填写
-MODEL=$(uvx --from huggingface_hub hf download -q \
-  handy-computer/Qwen3-ASR-1.7B-gguf Qwen3-ASR-1.7B-Q8_0.gguf)
-uv run --with transcribe-cpp python scripts/asr.py "$AUDIO" "$MODEL" > transcript.txt
+python3 scripts/asr.py "$AUDIO" > transcript.txt
+
+# 模型位于其他目录时显式传入 .gguf 文件或完整的 MLX 模型目录
+# python3 scripts/asr.py "$AUDIO" "$MODEL" > transcript.txt
+# 搜索范围、格式要求和无模型时的下载步骤见 SKILL.md 的“首选：Qwen3-ASR”
 
 # macOS 备用：Whisper.cpp CLI（先 brew install whisper.cpp ffmpeg，模型需另行下载）
 mkdir -p "$HOME/.cache/whisper.cpp"
@@ -103,7 +105,7 @@ python3 scripts/vtt2txt.py --selftest
 
 | 结论 | 依据 |
 |---|---|
-| Qwen3-ASR 必须分片 | 实测输出上限约 **474 字**，与音频长度、与 `n_ctx` 都无关（8192→262144 输出全是 474 字）；75s 片段正常，**90s 报 `run output truncated`**。当前 `asr.py` 默认约 60s 一片，优先吸附静音，截断时再递归二分重试 |
+| GGUF 后端需要处理输出截断 | 先前 `transcribe-cpp` 实测输出上限约 **474 字**，与音频长度、与 `n_ctx` 都无关（8192→262144 输出全是 474 字）；75s 片段正常，**90s 报 `run output truncated`**。这是该后端的实测结果，不代表所有 Qwen3-ASR 实现。当前两个后端共用约 60s 静音优先分片；GGUF 报告截断或 MLX 达到 token 上限时递归二分重试 |
 | 分片要吸附静音 | 固定时长硬切会斩断句子，模型在切口补一个句号，**造出原话不存在的假句界** |
 | 小宇宙官方稿无需分片 | 4 小时单集，**一次请求 71792 字、覆盖 100%** |
 | 逐字稿 CDN 只认 App UA | 浏览器 UA 直接 **403 Forbidden** |
@@ -123,7 +125,7 @@ video2article/
 ├── LICENSE
 └── scripts/
     ├── xyz.py            # 小宇宙官方逐字稿：续期 / 重试 / CDN / 元信息 / 官方章节
-    ├── asr.py            # Qwen 本地 ASR：静音优先分片 + 截断重试 + 密度复核提示
+    ├── asr.py            # 本地模型发现 + GGUF/MLX 后端 + 静音优先分片 + 截断重试
     └── vtt2txt.py        # WebVTT -> 纯文本
 ```
 

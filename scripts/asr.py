@@ -2,13 +2,15 @@
 """本地音频/视频转写，中文和中英混说优先使用 Qwen3-ASR-1.7B。
 
 用法:
-    uv run --with transcribe-cpp python asr.py <audio|video> <model.gguf>
+    python3 asr.py <audio|video> [model.gguf|MLX模型目录]
         [--chunk 60]    目标片长（秒），默认 60
         [--window 12]   在目标切点前后多少秒内找静音，默认 12
         [--fixed]       关闭静音优先，退回固定时长切分
     python3 asr.py --selftest
 
-依赖: Python 3.9+、ffmpeg / ffprobe 在 PATH 上、transcribe-cpp。
+依赖: ffmpeg / ffprobe 在 PATH 上；缺少推理库时由 uv 在 Python 3.12 环境中安装。
+未指定模型时先查本地 Qwen3-ASR；GGUF 用 transcribe-cpp，MLX 用 mlx-audio。
+模型下载由调用方处理，脚本只加载已有本地文件。
 
 脚本按短片段处理长录音，优先把切点放在静音处；模型明确报告输出截断时，
 自动对半切片重试。找不到静音时退回固定切点。
@@ -16,8 +18,17 @@
 
 from __future__ import annotations
 
+import argparse
 import array
+from contextlib import contextmanager, redirect_stdout
+from importlib.util import find_spec
+import json
+import math
+import os
+from pathlib import Path
+import platform
 import re
+import shutil
 import subprocess
 import sys
 
@@ -30,6 +41,137 @@ SILENCE_MIN_SECONDS = 0.3
 SAMPLE_RATE = 16000
 # 常见中文口播约 5–6 字/秒；慢速或停顿较多时会更低，密度只作核验提示。
 DENSITY_WARNING_THRESHOLD = 5.0
+MLX_MAX_TOKENS = 4096
+
+
+def model_backend(model_path: str) -> str:
+    """只接受本地 GGUF 文件或带完整配置与权重的 Qwen3-ASR MLX 目录。"""
+    path = Path(model_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"模型不存在: {path}")
+    if path.is_file() and path.suffix.lower() == ".gguf":
+        with path.open("rb") as f:
+            if f.read(4) == b"GGUF":
+                return "transcribe-cpp"
+        raise ValueError(f"不是有效的 GGUF 文件: {path}")
+    if path.is_dir():
+        config = json.loads((path / "config.json").read_text())
+        if config.get("model_type") != "qwen3_asr":
+            raise ValueError(f"不是 Qwen3-ASR 模型目录: {path}")
+        required = ["tokenizer_config.json", "preprocessor_config.json"]
+        if not (path / "tokenizer.json").is_file():
+            required += ["vocab.json", "merges.txt"]
+        index = path / "model.safetensors.index.json"
+        if index.is_file():
+            weights = set(json.loads(index.read_text())["weight_map"].values())
+        else:
+            weights = {"model.safetensors"}
+        if not weights or any(
+            not (path / name).is_file() or (path / name).stat().st_size == 0
+            for name in [*required, *weights]
+        ):
+            raise ValueError(f"MLX 模型文件不完整: {path}")
+        return "mlx-audio"
+    raise ValueError("请传入 .gguf 文件或包含配置、分词器和 .safetensors 权重的 MLX 目录")
+
+
+def find_local_model(roots=None) -> str:
+    """只搜索已知模型目录；显式传模型路径时无需搜索。"""
+    if roots is None:
+        home = Path.home()
+        hf_home = Path(os.environ.get("HF_HOME", home / ".cache/huggingface"))
+        roots = [
+            Path(os.environ.get("HF_HUB_CACHE", hf_home / "hub")),
+            home / "Library/Containers/com.voxt.Voxt/Data/Library/Application Support/Voxt/model-storage/mlx-audio",
+            home / "models",
+            home / ".lmstudio/models",
+            home / ".cache/lm-studio/models",
+        ]
+    apple_silicon = sys.platform == "darwin" and platform.machine() == "arm64"
+    candidates = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        # 模型仓库可能位于作者子目录；只深入名称匹配的 Qwen3-ASR 仓库。
+        repos = [p for p in root.iterdir()]
+        repos += [p for d in list(repos) if d.is_dir() for p in d.iterdir()]
+        for repo in repos:
+            if "qwen3asr" not in re.sub(r"[^a-z0-9]", "", repo.name.lower()):
+                continue
+            paths = [repo] if repo.is_file() else [
+                *repo.rglob("*.gguf"), *(p.parent for p in repo.rglob("config.json"))
+            ]
+            for path in paths:
+                try:
+                    backend = model_backend(str(path))
+                except (OSError, ValueError, KeyError) as exc:
+                    print(f"  忽略不可用的模型候选 {path}: {exc}", file=sys.stderr)
+                    continue
+                if backend == "mlx-audio" and not apple_silicon:
+                    continue
+                candidates[str(path.resolve())] = backend
+    if not candidates:
+        raise FileNotFoundError("常见目录中未找到可用的本地 Qwen3-ASR；请按 SKILL.md 下载模型或显式传入路径")
+    return min(candidates, key=lambda p: (
+        "1.7b" not in p.lower(),
+        candidates[p] != ("mlx-audio" if apple_silicon else "transcribe-cpp"), p,
+    ))
+
+
+def ensure_backend(backend: str) -> None:
+    module = "mlx_audio" if backend == "mlx-audio" else "transcribe_cpp"
+    if find_spec(module) is not None:
+        return
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(f"缺少 {backend} 和 uv；请先安装 uv 后重试")
+    package = "mlx-audio[stt]==0.5.9" if backend == "mlx-audio" else "transcribe-cpp"
+    print(f"  通过 uv 准备 {package}（复用缓存或安装缺少的依赖）", file=sys.stderr)
+    raise SystemExit(subprocess.call([
+        uv, "run", "--no-project", "--python", "3.12", "--with", package,
+        "python", str(Path(__file__).resolve()), *sys.argv[1:],
+    ]))
+
+
+class OutputTruncated(Exception):
+    """MLX 命中生成 token 上限，交由共用分片逻辑重试。"""
+
+
+class MLXSession:
+    def __init__(self, model_path: str):
+        import mlx.core as mx
+        from mlx_audio.stt.utils import load_model
+
+        self.mx = mx
+        self.model = load_model(Path(model_path), strict=True)
+
+    def run(self, pcm: array.array):
+        result = self.model.generate(
+            self.mx.array(pcm.tolist(), dtype=self.mx.float32),
+            max_tokens=MLX_MAX_TOKENS, verbose=False,
+        )
+        if result.generation_tokens >= MLX_MAX_TOKENS:
+            raise OutputTruncated("MLX 输出达到 token 上限")
+        return result
+
+    def close(self):
+        self.model = None
+        self.mx.clear_cache()
+
+
+@contextmanager
+def open_session(model_path: str, backend: str):
+    if backend == "transcribe-cpp":
+        from transcribe_cpp import Model
+
+        with Model(model_path) as model:
+            yield model.session()
+    else:
+        session = MLXSession(model_path)
+        try:
+            yield session
+        finally:
+            session.close()
 
 
 def _run(cmd: list[str]) -> bytes:
@@ -69,6 +211,8 @@ def plan_cuts(
     window: float = WINDOW_SECONDS,
 ) -> list[float]:
     """算出切点。优先吸附到目标切点附近的静音中点，否则退回目标切点本身。"""
+    if not math.isfinite(target) or not math.isfinite(window) or target <= 0 or window < 0:
+        raise ValueError("chunk 必须是有限正数，window 必须是有限非负数")
     if target + window > MAX_SAFE_SECONDS:
         raise ValueError(
             f"chunk({target}) + window({window}) 超过安全上限 {MAX_SAFE_SECONDS}s，"
@@ -90,7 +234,7 @@ def plan_cuts(
 
 
 def load_pcm(path: str, start: float, end: float) -> array.array:
-    """取 [start, end) 音频，转成 16 kHz 单声道 float32 PCM（transcribe-cpp 要的格式）。"""
+    """取 [start, end) 音频，转成两个后端共用的 16 kHz 单声道 float32 PCM。"""
     raw = _run([
         "ffmpeg", "-v", "error",
         "-ss", f"{start:.3f}", "-t", f"{max(end - start, 0):.3f}",
@@ -109,7 +253,7 @@ def transcribe_chunk(session, pcm: array.array, on_truncated=None) -> list[str]:
     try:
         return [session.run(pcm).text]
     except Exception as exc:
-        if type(exc).__name__ != "OutputTruncated":
+        if not any(cls.__name__ == "OutputTruncated" for cls in type(exc).__mro__):
             raise
         if on_truncated:
             on_truncated(len(pcm))
@@ -128,8 +272,7 @@ def transcribe_file(
     window: float = WINDOW_SECONDS,
     use_silence: bool = True,
 ) -> str:
-    from transcribe_cpp import Model
-
+    backend = model_backend(model_path)
     total = duration(path)
     silences = detect_silences(path) if use_silence else []
     cuts = plan_cuts(total, silences, chunk, window)
@@ -141,19 +284,15 @@ def transcribe_file(
         file=sys.stderr,
     )
 
-    model = Model(model_path)
-    session = model.session()
     parts: list[str] = []
 
     def note(n: int) -> None:
         print(f"    [超限，对半切] {n / SAMPLE_RATE:.0f}s", file=sys.stderr)
 
-    try:
+    with redirect_stdout(sys.stderr), open_session(model_path, backend) as session:
         for i, (a, b) in enumerate(bounds):
             print(f"    [{i:02d}] {a:7.1f}s – {b:7.1f}s  ({b - a:.1f}s)", file=sys.stderr)
             parts += transcribe_chunk(session, load_pcm(path, a, b), note)
-    finally:
-        model.close()
 
     text = "\n".join(p for p in parts if p.strip())
     # 密度只提示复核：语速慢、停顿多的音频也可能低于阈值。
@@ -233,6 +372,79 @@ def _selftest() -> int:
     pcm.frombytes(raw)
     assert len(pcm) == SAMPLE_RATE, f"期望 {SAMPLE_RATE} 个样本，得到 {len(pcm)}"
 
+    # --- 本地模型发现和格式判定：复用已有模型，不接受残缺 MLX 目录 ---
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        gguf = root / "Qwen3-ASR-1.7B-Q8_0.gguf"
+        gguf.write_bytes(b"GGUF")
+        mlx = root / "mlx-community_Qwen3-ASR-1.7B-8bit"
+        mlx.mkdir()
+        (mlx / "config.json").write_text('{"model_type":"qwen3_asr"}')
+        for name in ["tokenizer_config.json", "preprocessor_config.json", "tokenizer.json"]:
+            (mlx / name).write_text("{}")
+        (mlx / "model.safetensors").write_bytes(b"weights")
+        assert model_backend(str(gguf)) == "transcribe-cpp"
+        assert model_backend(str(mlx)) == "mlx-audio"
+        with patch.object(sys, "platform", "darwin"), patch.object(platform, "machine", return_value="arm64"):
+            assert find_local_model([root]) == str(mlx.resolve())
+        with patch.object(sys, "platform", "linux"):
+            assert find_local_model([root]) == str(gguf.resolve())
+        (mlx / "model.safetensors.index.json").write_text(
+            '{"weight_map":{"weight":"missing-shard.safetensors"}}'
+        )
+        try:
+            model_backend(str(mlx))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("缺少分片权重时不能当作完整模型")
+        with TemporaryDirectory() as empty:
+            try:
+                find_local_model([Path(empty)])
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("没有本地模型时必须明确报错")
+
+    # --- MLX token 上限使用共用二分重试，保留全部音频样本 ---
+    from types import SimpleNamespace
+
+    mlx_session = MLXSession.__new__(MLXSession)
+    mlx_session.mx = SimpleNamespace(array=lambda values, dtype: values, float32="float32")
+    mlx_session.model = SimpleNamespace(generate=lambda audio, **kwargs: SimpleNamespace(
+        text=f"<{len(audio)}>", generation_tokens=len(audio),
+    ))
+    assert transcribe_chunk(
+        mlx_session, array.array("f", bytes(MLX_MAX_TOKENS * 2 * 4))
+    ) == [f"<{MLX_MAX_TOKENS // 2}>"] * 4
+
+    # 缺依赖才启动 uv，且只安装选中的后端；已有依赖时直接复用。
+    with patch(__name__ + ".find_spec", return_value=object()), patch.object(subprocess, "call") as call:
+        ensure_backend("mlx-audio")
+        call.assert_not_called()
+    for backend, package in [("mlx-audio", "mlx-audio[stt]==0.5.9"), ("transcribe-cpp", "transcribe-cpp")]:
+        with patch(__name__ + ".find_spec", return_value=None), patch.object(shutil, "which", return_value="uv"), patch.object(subprocess, "call", return_value=0) as call:
+            try:
+                ensure_backend(backend)
+            except SystemExit as exc:
+                assert exc.code == 0
+            else:
+                raise AssertionError("缺依赖时应在 uv 环境中重新运行")
+            command = call.call_args.args[0]
+            assert command[command.index("--with") + 1] == package
+            assert "--no-project" in command
+
+    for target, window in [(0, 12), (-1, 12), (60, -1), (float("nan"), 12)]:
+        try:
+            plan_cuts(300, [], target, window)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("无效片长或窗口必须在处理音频前报错")
+
     print("selftest ok")
     return 0
 
@@ -241,22 +453,30 @@ def main(argv: list[str]) -> int:
     if "--selftest" in argv:
         return _selftest()
 
-    def opt(name: str, default: float) -> float:
-        return float(argv[argv.index(name) + 1]) if name in argv else default
-
-    args = [a for a in argv[1:] if not a.startswith("--")]
-    for flag in ("--chunk", "--window"):
-        if flag in argv:
-            args = [a for a in args if a != argv[argv.index(flag) + 1]]
-    if len(args) < 2:
-        print(__doc__.strip(), file=sys.stderr)
-        return 2
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("audio")
+    parser.add_argument("model", nargs="?")
+    parser.add_argument("--chunk", type=float, default=TARGET_SECONDS)
+    parser.add_argument("--window", type=float, default=WINDOW_SECONDS)
+    parser.add_argument("--fixed", action="store_true")
+    args = parser.parse_args(argv[1:])
+    if not Path(args.audio).is_file():
+        parser.error(f"音频文件不存在: {args.audio}")
+    for command in ("ffmpeg", "ffprobe"):
+        if shutil.which(command) is None:
+            parser.error(f"缺少 {command}；请先安装 FFmpeg")
+    model_path = str(Path(args.model).expanduser().resolve()) if args.model else find_local_model()
+    backend = model_backend(model_path)
+    if backend == "mlx-audio" and not (
+        sys.platform == "darwin" and platform.machine() == "arm64"
+    ):
+        parser.error("MLX 后端需要 Apple Silicon Mac；请使用 GGUF 模型")
+    plan_cuts(0, [], args.chunk, args.window)
+    print(f"  模型 {model_path}\n  后端 {backend}", file=sys.stderr)
+    ensure_backend(backend)
     print(transcribe_file(
-        args[0], args[1],
-        chunk=opt("--chunk", TARGET_SECONDS),
-        window=opt("--window", WINDOW_SECONDS),
-        use_silence="--fixed" not in argv,
+        args.audio, model_path,
+        chunk=args.chunk, window=args.window, use_silence=not args.fixed,
     ))
     return 0
 

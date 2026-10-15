@@ -119,27 +119,39 @@ AUDIO="audio.mp3" # 按实际下载的扩展名填写
 
 #### 首选：Qwen3-ASR
 
-中文或中英混说优先 **Qwen3-ASR-1.7B**。
+中文或中英混说优先 **Qwen3-ASR-1.7B**。先复用本地模型，再按模型格式加载；长短音频统一使用 `scripts/asr.py`。
 
-**Pi 中使用 pi-voice：**安装插件和 FFmpeg，在 `/voice-settings` 里选择 Qwen3-ASR；然后让 Pi 调用 `transcribe_file` 工具（它不是 shell 命令）。
+需要 Python 3.9+、`uv` 和 FFmpeg（含 `ffprobe`；macOS 缺少工具时可用 `brew install uv ffmpeg`）。
 
-```bash
-pi install npm:@earendil-works/pi-voice
-brew install ffmpeg
-```
-
-`transcribe_file` 适合 35 分钟以内的音频；更长音频或非 Pi 环境，使用仓库中的 `scripts/asr.py`。需要 `uv` 和 FFmpeg（macOS 可用 `brew install uv ffmpeg`）：
+**1. 先找本地模型。** 直接运行脚本，它会在 Hugging Face 缓存（遵循 `HF_HUB_CACHE` / `HF_HOME`）、Voxt 的 `model-storage/mlx-audio`、`~/models`、`~/.lmstudio/models` 和 `~/.cache/lm-studio/models` 中，按名称匹配 Qwen3-ASR 仓库并检查文件。优先 1.7B；同规格时，Apple Silicon Mac 优先 MLX，其他平台使用 GGUF。搜索范围不包括整块磁盘；用户指定了其他目录或模型目录已改名时，先检查该目录并显式传入模型路径。
 
 ```bash
-# 模型下载到 Hugging Face 默认缓存，可供 Pi Voice 和脚本共用
-MODEL=$(uvx --from huggingface_hub hf download -q \
-  handy-computer/Qwen3-ASR-1.7B-gguf Qwen3-ASR-1.7B-Q8_0.gguf)
+python3 "<本 skill 目录>/scripts/asr.py" "$AUDIO" > transcript.txt
 
-uv run --with transcribe-cpp python \
-  "<本 skill 目录>/scripts/asr.py" "$AUDIO" "$MODEL" > transcript.txt
+# 手动指定：MODEL 是 .gguf 文件，或包含配置、分词器和权重的 MLX 目录
+# MODEL="/绝对路径/Qwen3-ASR-1.7B-Q8_0.gguf"
+# MODEL="/绝对路径/mlx-community_Qwen3-ASR-1.7B-8bit"
+# python3 "<本 skill 目录>/scripts/asr.py" "$AUDIO" "$MODEL" > transcript.txt
 ```
 
-脚本会静音优先分片、自动重试被截断片段，并输出转写字数密度。密度低于 5 字/秒只作复核提示：检查音频开头、结尾和片段，不要单凭密度判定漏转。长音频优先用此脚本，不要手工拼切片。
+**2. 按格式准备依赖。** 脚本检查当前 Python 是否有对应模块：GGUF 使用 `transcribe-cpp`；Qwen3-ASR MLX 目录使用 `mlx-audio`（仅 Apple Silicon Mac，当前验证版本 0.5.9，安装时包含 `stt` 依赖）。缺少对应库时，脚本通过 `uv run --no-project --python 3.12 --with ...` 安装并重新运行，只准备选中的后端。uv 复用缓存，通常位于 `~/.cache/uv/`；这不是安装到系统 Python。普通 `.safetensors` 文件不足以判定可用，脚本还会核对 Qwen3-ASR 配置、分词器和权重文件。
+
+**3. 本地没找到可用模型时才下载。** 已有模型加载失败时先报告并检查文件与依赖，不能当作“没有模型”重复下载。确认常见目录和用户指定目录均没有可用模型后，Apple Silicon Mac 下载 MLX 版，其他平台下载 GGUF 版：
+
+```bash
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+  MODEL=$(uvx --from huggingface_hub hf download -q \
+    mlx-community/Qwen3-ASR-1.7B-8bit)
+else
+  MODEL=$(uvx --from huggingface_hub hf download -q \
+    handy-computer/Qwen3-ASR-1.7B-gguf Qwen3-ASR-1.7B-Q8_0.gguf)
+fi
+python3 "<本 skill 目录>/scripts/asr.py" "$AUDIO" "$MODEL" > transcript.txt
+```
+
+模型默认下载到 Hugging Face 缓存（通常为 `~/.cache/huggingface/hub/`），后续直接复用。
+
+两个后端共用静音优先分片和转写字数密度提示。GGUF 报告输出截断、或 MLX 达到生成 token 上限时，脚本对半切片重试。密度低于 5 字/秒只作复核提示：检查音频开头、结尾和片段，不要单凭密度判定漏转。长音频也由脚本处理，不要手工拼切片。
 
 #### 备用：macOS Whisper.cpp CLI
 
